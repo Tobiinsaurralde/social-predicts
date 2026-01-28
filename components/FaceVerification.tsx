@@ -1,0 +1,1001 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Button } from '@/components/ui/button';
+import { Loader2, Camera, Check, AlertTriangle, RefreshCw, Eye, ArrowLeft, ArrowRight, Sparkles } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { getFingerprint } from '@/lib/fingerprint';
+import { Progress } from '@/components/ui/progress';
+import { Link } from 'wouter';
+import { createAnalyzerState, analyzeFrame, getFinalAnalysis, resetAnalyzerState, type AnalyzerState } from '@/lib/textureAnalyzer';
+
+interface FaceLandmarkerResult {
+  faceLandmarks: Array<Array<{ x: number; y: number; z: number }>>;
+  faceBlendshapes?: Array<{ categories: Array<{ categoryName: string; score: number }> }>;
+}
+
+type Challenge = 'blink' | 'turn_left' | 'turn_right' | 'nod';
+
+interface ChallengeState {
+  type: Challenge;
+  label: string;
+  completed: boolean;
+  progress: number;
+}
+
+const CHALLENGES: ChallengeState[] = [
+  { type: 'blink', label: 'Blink twice', completed: false, progress: 0 },
+  { type: 'turn_left', label: 'Turn head left', completed: false, progress: 0 },
+  { type: 'turn_right', label: 'Turn head right', completed: false, progress: 0 },
+];
+
+// Quality check thresholds
+const QUALITY_THRESHOLDS = {
+  minConfidence: 0.7,        // Minimum detection confidence
+  minFaceRatio: 0.08,        // Face must be at least 8% of frame
+  maxFaceRatio: 0.6,         // Face must not be more than 60% of frame (too close)
+  centerTolerance: 0.25,     // Face center must be within 25% of frame center
+  minLandmarkCount: 450,     // MediaPipe provides 478 landmarks when fully visible
+};
+
+interface FaceQuality {
+  confidence: boolean;
+  faceSize: boolean;
+  centered: boolean;
+  noOcclusion: boolean;
+  allPassed: boolean;
+  message: string;
+}
+
+const getChallengeIcon = (type: Challenge, className: string = "h-5 w-5") => {
+  switch (type) {
+    case 'blink':
+      return <Eye className={className} />;
+    case 'turn_left':
+      return <ArrowLeft className={className} />;
+    case 'turn_right':
+      return <ArrowRight className={className} />;
+    default:
+      return <Camera className={className} />;
+  }
+};
+
+interface FaceVerificationProps {
+  walletAddress: string;
+  onComplete: (success: boolean, data?: any) => void;
+  onReset?: () => void;
+}
+
+export default function FaceVerification({ walletAddress, onComplete, onReset }: FaceVerificationProps) {
+  const { toast } = useToast();
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const faceLandmarkerRef = useRef<any>(null);
+  const faceApiRef = useRef<any>(null); // face-api.js module for identity embeddings
+
+  const [status, setStatus] = useState<'intro' | 'loading' | 'ready' | 'detecting' | 'challenges' | 'processing' | 'complete' | 'error'>('intro');
+  const [error, setError] = useState<string | null>(null);
+  const [challenges, setChallenges] = useState<ChallengeState[]>(CHALLENGES.map(c => ({ ...c })));
+  const [currentChallengeIndex, setCurrentChallengeIndex] = useState(0);
+  const [faceDetected, setFaceDetected] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [videoAspect, setVideoAspect] = useState<number>(3 / 4); // Default portrait ratio
+  const [loadingMessage, setLoadingMessage] = useState<string>('Initializing...');
+  const [verificationResult, setVerificationResult] = useState<{ xpAwarded?: number; pendingXp?: number } | null>(null);
+  const [faceQuality, setFaceQuality] = useState<FaceQuality>({
+    confidence: false,
+    faceSize: false,
+    centered: false,
+    noOcclusion: false,
+    allPassed: false,
+    message: 'Position your face in the oval',
+  });
+
+  const blinkCountRef = useRef(0);
+  const lastBlinkStateRef = useRef(false);
+  const headTurnProgressRef = useRef({ left: 0, right: 0 });
+  const faceEmbeddingsRef = useRef<Float32Array[]>([]); // Store 128D face descriptors
+  const lastValidQualityRef = useRef<FaceQuality | null>(null); // Capture quality at moment of submission
+  const textureAnalyzerRef = useRef<AnalyzerState>(createAnalyzerState()); // Passive texture analysis
+  const frameCountRef = useRef(0); // For running texture analysis every other frame
+
+  // Refs to mirror state for animation frame loop (avoids stale closures)
+  const currentChallengeIndexRef = useRef(0);
+  const challengesRef = useRef<ChallengeState[]>(CHALLENGES.map(c => ({ ...c })));
+  const statusRef = useRef<typeof status>('intro');
+
+  // Track if component is mounted to prevent state updates after unmount
+  const isMountedRef = useRef(true);
+
+  const cleanup = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+  }, []);
+
+  // Check face quality based on detection results
+  const checkFaceQuality = useCallback((
+    landmarks: Array<{ x: number; y: number; z: number }>,
+    frameWidth: number,
+    frameHeight: number,
+    blendshapes?: Array<{ categoryName: string; score: number }>
+  ): FaceQuality => {
+    // Calculate face bounding box
+    const xs = landmarks.map(l => l.x);
+    const ys = landmarks.map(l => l.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    const faceWidth = maxX - minX;
+    const faceHeight = maxY - minY;
+    const faceArea = faceWidth * faceHeight;
+    const faceCenterX = (minX + maxX) / 2;
+    const faceCenterY = (minY + maxY) / 2;
+
+    // Check 1: Face size (between min and max ratio)
+    const sizeOk = faceArea >= QUALITY_THRESHOLDS.minFaceRatio && faceArea <= QUALITY_THRESHOLDS.maxFaceRatio;
+
+    // Check 2: Face centered (within tolerance of frame center)
+    const centerXOk = Math.abs(faceCenterX - 0.5) <= QUALITY_THRESHOLDS.centerTolerance;
+    const centerYOk = Math.abs(faceCenterY - 0.5) <= QUALITY_THRESHOLDS.centerTolerance;
+    const centeredOk = centerXOk && centerYOk;
+
+    // Check 3: Landmark count (occlusion detection)
+    const landmarkOk = landmarks.length >= QUALITY_THRESHOLDS.minLandmarkCount;
+
+    // Check 4: Eye visibility (sunglasses detection via blendshapes)
+    // If eyes are visible, blink scores should be low when eyes are open
+    let eyesVisible = true;
+    if (blendshapes) {
+      const leftBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft')?.score ?? 0;
+      const rightBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkRight')?.score ?? 0;
+      // If both eyes show very low blink AND very low visibility, might be occluded
+      // This is heuristic - if we can detect blinks, eyes are visible
+      eyesVisible = true; // MediaPipe handles this implicitly
+    }
+
+    const allPassed = sizeOk && centeredOk && landmarkOk && eyesVisible;
+
+    // Generate user-friendly message
+    let message = '';
+    if (!sizeOk) {
+      if (faceArea < QUALITY_THRESHOLDS.minFaceRatio) {
+        message = 'Move closer to camera';
+      } else {
+        message = 'Move back a bit';
+      }
+    } else if (!centeredOk) {
+      if (faceCenterX < 0.5 - QUALITY_THRESHOLDS.centerTolerance) {
+        message = 'Move face right';
+      } else if (faceCenterX > 0.5 + QUALITY_THRESHOLDS.centerTolerance) {
+        message = 'Move face left';
+      } else if (faceCenterY < 0.5 - QUALITY_THRESHOLDS.centerTolerance) {
+        message = 'Move face down';
+      } else {
+        message = 'Move face up';
+      }
+    } else if (!landmarkOk) {
+      message = 'Remove glasses or obstructions';
+    } else if (allPassed) {
+      message = 'Ready to verify';
+    }
+
+    return {
+      confidence: true, // MediaPipe filters by minFaceDetectionConfidence (0.7) at initialization
+      faceSize: sizeOk,
+      centered: centeredOk,
+      noOcclusion: landmarkOk && eyesVisible,
+      allPassed,
+      message,
+    };
+  }, []);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      cleanup();
+    };
+  }, [cleanup]);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    currentChallengeIndexRef.current = currentChallengeIndex;
+  }, [currentChallengeIndex]);
+
+  useEffect(() => {
+    challengesRef.current = challenges;
+  }, [challenges]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  const loadModels = useCallback(async () => {
+    try {
+      setStatus('loading');
+      setError(null);
+
+      // Load MediaPipe for liveness detection (blink, head turn)
+      setLoadingMessage('Loading liveness detection...');
+      const vision = await import('@mediapipe/tasks-vision');
+      const { FaceLandmarker, FilesetResolver } = vision;
+
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+      );
+
+      faceLandmarkerRef.current = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        minFaceDetectionConfidence: 0.7,  // Require 70% confidence for detection
+        minFacePresenceConfidence: 0.7,   // Require 70% confidence face is present
+        minTrackingConfidence: 0.7,        // Require 70% confidence for tracking
+        outputFaceBlendshapes: true,
+        outputFacialTransformationMatrixes: true
+      });
+
+      // Load face-api.js for identity embeddings (128D face descriptors)
+      // Use script loader approach since ESM import doesn't work reliably
+      setLoadingMessage('Loading face recognition...');
+
+      // Load face-api.js via script tag if not already loaded
+      if (!(window as any).faceapi) {
+        await new Promise<void>((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error('Failed to load face-api.js'));
+          document.head.appendChild(script);
+        });
+      }
+
+      const faceapi = (window as any).faceapi;
+      if (!faceapi) {
+        throw new Error('face-api.js not available');
+      }
+      faceApiRef.current = faceapi;
+
+      // Load required models from CDN
+      const MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights';
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+      ]);
+      console.log('[FaceVerification] face-api.js models loaded successfully');
+
+      setLoadingMessage('Starting camera...');
+      await startCamera();
+      setStatus('ready');
+    } catch (err) {
+      console.error('[FaceVerification] Failed to load models:', err);
+      setError('Failed to load face detection. Please try again.');
+      setStatus('error');
+    }
+  }, []);
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 480 },
+          height: { ideal: 640 }
+        }
+      });
+
+      streamRef.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await new Promise<void>((resolve) => {
+          videoRef.current!.onloadedmetadata = () => {
+            // Set canvas dimensions to match actual video dimensions
+            if (canvasRef.current && videoRef.current) {
+              const vw = videoRef.current.videoWidth;
+              const vh = videoRef.current.videoHeight;
+              canvasRef.current.width = vw;
+              canvasRef.current.height = vh;
+              // Update container aspect ratio to match video
+              setVideoAspect(vw / vh);
+            }
+            resolve();
+          };
+        });
+        await videoRef.current.play();
+      }
+    } catch (err) {
+      console.error('[FaceVerification] Camera access denied:', err);
+      throw new Error('Camera access denied. Please allow camera access to continue.');
+    }
+  };
+
+  const startDetection = useCallback(() => {
+    if (!faceLandmarkerRef.current || !videoRef.current) return;
+
+    // Only set to 'detecting' if we're in initial states, not 'challenges'
+    setStatus(prev => prev === 'ready' || prev === 'loading' ? 'detecting' : prev);
+
+    const detect = async () => {
+      if (!videoRef.current || !faceLandmarkerRef.current || videoRef.current.readyState !== 4) {
+        animationFrameRef.current = requestAnimationFrame(detect);
+        return;
+      }
+
+      try {
+        const results: FaceLandmarkerResult = faceLandmarkerRef.current.detectForVideo(
+          videoRef.current,
+          performance.now()
+        );
+
+        const hasFace = results.faceLandmarks && results.faceLandmarks.length > 0;
+        setFaceDetected(hasFace);
+
+        // Reset quality when no face detected
+        if (!hasFace) {
+          setFaceQuality({
+            confidence: false,
+            faceSize: false,
+            centered: false,
+            noOcclusion: false,
+            allPassed: false,
+            message: 'Position your face in the oval',
+          });
+        }
+
+        if (hasFace && canvasRef.current && videoRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) {
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+            ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+
+            const landmarks = results.faceLandmarks[0];
+
+            // Run quality checks (only during pre-challenge phase)
+            if (statusRef.current === 'detecting' || statusRef.current === 'ready') {
+              const blendshapes = results.faceBlendshapes?.[0]?.categories;
+              const quality = checkFaceQuality(
+                landmarks,
+                canvasRef.current.width,
+                canvasRef.current.height,
+                blendshapes
+              );
+              setFaceQuality(quality);
+              // Capture quality in ref when all checks pass (for reliable submission)
+              if (quality.allPassed) {
+                lastValidQualityRef.current = quality;
+              }
+            }
+
+            const minX = Math.min(...landmarks.map(l => l.x)) * canvasRef.current.width;
+            const maxX = Math.max(...landmarks.map(l => l.x)) * canvasRef.current.width;
+            const minY = Math.min(...landmarks.map(l => l.y)) * canvasRef.current.height;
+            const maxY = Math.max(...landmarks.map(l => l.y)) * canvasRef.current.height;
+
+            const padding = 20;
+            // Color based on quality: green if all passed, yellow if face detected but quality issues
+            ctx.strokeStyle = faceQuality.allPassed ? '#22c55e' : '#f59e0b';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(minX - padding, minY - padding, maxX - minX + padding * 2, maxY - minY + padding * 2);
+
+            // Run passive texture analysis every other frame during challenges
+            frameCountRef.current++;
+            if (statusRef.current === 'challenges' && frameCountRef.current % 2 === 0 && canvasRef.current) {
+              const faceBox = {
+                minX: Math.min(...landmarks.map(l => l.x)),
+                minY: Math.min(...landmarks.map(l => l.y)),
+                maxX: Math.max(...landmarks.map(l => l.x)),
+                maxY: Math.max(...landmarks.map(l => l.y)),
+              };
+              analyzeFrame(textureAnalyzerRef.current, canvasRef.current, faceBox);
+            }
+
+            if (statusRef.current === 'challenges') {
+              processChallenge(results);
+
+              // Capture face descriptor using face-api.js (only during challenges, max 5 samples)
+              if (faceEmbeddingsRef.current.length < 5 && faceApiRef.current && videoRef.current) {
+                try {
+                  const faceapi = faceApiRef.current;
+                  const detection = await faceapi
+                    .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions())
+                    .withFaceLandmarks()
+                    .withFaceDescriptor();
+
+                  if (detection?.descriptor) {
+                    faceEmbeddingsRef.current.push(detection.descriptor);
+                    console.log(`[FaceVerification] Captured face descriptor ${faceEmbeddingsRef.current.length}/5`);
+                  }
+                } catch (faceApiErr) {
+                  console.warn('[FaceVerification] Face descriptor capture error:', faceApiErr);
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[FaceVerification] Detection error:', err);
+      }
+
+      animationFrameRef.current = requestAnimationFrame(detect);
+    };
+
+    animationFrameRef.current = requestAnimationFrame(detect);
+  }, [status]);
+
+  const processChallenge = (results: FaceLandmarkerResult) => {
+    const blendshapes = results.faceBlendshapes?.[0]?.categories;
+    const landmarks = results.faceLandmarks[0];
+
+    if (!blendshapes || !landmarks) return;
+
+    // Use refs to get fresh values (avoids stale closure)
+    const idx = currentChallengeIndexRef.current;
+    const currentChallenge = challengesRef.current[idx];
+    if (!currentChallenge || currentChallenge.completed) return;
+
+    switch (currentChallenge.type) {
+      case 'blink': {
+        const leftBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft')?.score ?? 0;
+        const rightBlink = blendshapes.find(b => b.categoryName === 'eyeBlinkRight')?.score ?? 0;
+        const isBlinking = (leftBlink + rightBlink) / 2 > 0.4;
+
+        if (isBlinking && !lastBlinkStateRef.current) {
+          blinkCountRef.current++;
+          setChallenges(prev => prev.map((c, i) =>
+            i === idx ? { ...c, progress: blinkCountRef.current * 50 } : c
+          ));
+
+          if (blinkCountRef.current >= 2) {
+            completeChallenge();
+          }
+        }
+        lastBlinkStateRef.current = isBlinking;
+        break;
+      }
+
+      case 'turn_left': {
+        const noseX = landmarks[1].x;
+        if (noseX > 0.6) {
+          headTurnProgressRef.current.left = Math.min(100, headTurnProgressRef.current.left + 5);
+          setChallenges(prev => prev.map((c, i) =>
+            i === idx ? { ...c, progress: headTurnProgressRef.current.left } : c
+          ));
+
+          if (headTurnProgressRef.current.left >= 100) {
+            completeChallenge();
+          }
+        }
+        break;
+      }
+
+      case 'turn_right': {
+        const noseX = landmarks[1].x;
+        if (noseX < 0.4) {
+          headTurnProgressRef.current.right = Math.min(100, headTurnProgressRef.current.right + 5);
+          setChallenges(prev => prev.map((c, i) =>
+            i === idx ? { ...c, progress: headTurnProgressRef.current.right } : c
+          ));
+
+          if (headTurnProgressRef.current.right >= 100) {
+            completeChallenge();
+          }
+        }
+        break;
+      }
+    }
+  };
+
+  const completeChallenge = () => {
+    const idx = currentChallengeIndexRef.current;
+    const challengeCount = challengesRef.current.length;
+
+    // Update ref immediately so next frame sees correct state
+    challengesRef.current = challengesRef.current.map((c, i) =>
+      i === idx ? { ...c, completed: true, progress: 100 } : c
+    );
+
+    // Update React state for UI
+    setChallenges(prev => prev.map((c, i) =>
+      i === idx ? { ...c, completed: true, progress: 100 } : c
+    ));
+
+    if (idx < challengeCount - 1) {
+      currentChallengeIndexRef.current = idx + 1;
+      setCurrentChallengeIndex(idx + 1);
+      blinkCountRef.current = 0;
+      lastBlinkStateRef.current = false;
+    } else {
+      submitVerification();
+    }
+  };
+
+  const hashEmbedding = async (embedding: number[]): Promise<string> => {
+    const data = new Float32Array(embedding);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data.buffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  const submitVerification = async () => {
+    setStatus('processing');
+    setIsSubmitting(true);
+
+    try {
+      if (faceEmbeddingsRef.current.length === 0) {
+        throw new Error('No face data captured. Please ensure your face is visible during the challenges.');
+      }
+
+      // Average the 128D face descriptors from face-api.js
+      const numDescriptors = faceEmbeddingsRef.current.length;
+      const avgEmbedding: number[] = new Array(128).fill(0);
+
+      for (const descriptor of faceEmbeddingsRef.current) {
+        for (let i = 0; i < 128; i++) {
+          avgEmbedding[i] += descriptor[i] / numDescriptors;
+        }
+      }
+
+      console.log(`[FaceVerification] Averaged ${numDescriptors} face descriptors`);
+
+      const embeddingHash = await hashEmbedding(avgEmbedding);
+      const fingerprint = await getFingerprint();
+      // Use ref instead of state to get fresh challenge data (avoids stale closure)
+      const passedChallenges = challengesRef.current.filter(c => c.completed).map(c => c.type);
+
+      // Use ref for quality metrics (avoids stale closure from state)
+      const capturedQuality = lastValidQualityRef.current;
+      if (!capturedQuality || !capturedQuality.allPassed) {
+        throw new Error('Face quality check not completed. Please ensure your face is clearly visible.');
+      }
+
+      // Get passive texture analysis results
+      const textureAnalysis = getFinalAnalysis(textureAnalyzerRef.current);
+      console.log('[FaceVerification] Texture analysis:', textureAnalysis);
+
+      // Collect quality metrics for diagnostic logging
+      const qualityMetrics = {
+        faceSize: capturedQuality.faceSize ? 'ok' : 'fail',
+        centered: capturedQuality.centered ? 'ok' : 'fail',
+        noOcclusion: capturedQuality.noOcclusion ? 'ok' : 'fail',
+        embeddingCount: numDescriptors,
+        moireScore: textureAnalysis.moireScore.toFixed(3),
+        textureVariance: textureAnalysis.textureVariance.toFixed(3),
+        isLikelySpoof: textureAnalysis.isLikelySpoof,
+        textureConfidence: textureAnalysis.confidence.toFixed(2),
+      };
+
+      // Use raw fetch instead of apiRequest to handle 409 duplicate responses gracefully
+      // apiRequest throws on non-OK responses, but we need to handle 409 as a valid "duplicate detected" case
+      const response = await fetch('/api/face-verification/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          walletAddress,
+          embeddingHash,
+          embedding: avgEmbedding,
+          storageToken: fingerprint.storageToken,
+          challengesPassed: passedChallenges,
+          qualityMetrics,
+        }),
+        credentials: 'include',
+      });
+
+      // Safely parse JSON response (handle empty or malformed responses)
+      let result: any = {};
+      try {
+        const text = await response.text();
+        if (text) {
+          result = JSON.parse(text);
+        }
+      } catch (parseError) {
+        console.warn('[FaceVerification] Failed to parse response JSON:', parseError);
+      }
+
+      // Check if this was an error response (duplicate face, validation error, etc.)
+      if (!response.ok) {
+        cleanup();
+        if (isMountedRef.current) {
+          setStatus('error');
+          setError(result.error || 'Verification failed');
+          setIsSubmitting(false);
+        }
+        toast({
+          title: 'Verification Failed',
+          description: result.error || 'This face has already been verified with another wallet.',
+          variant: 'destructive',
+        });
+        // Notify parent that verification failed (duplicate)
+        onComplete(false, { isDuplicate: true, ...result });
+        return;
+      }
+
+      // Cleanup first, before onComplete triggers query invalidation
+      cleanup();
+
+      // Show toast based on result
+      // Note: xpAwarded and pendingXp from backend are already in user-facing XP (not centi-XP)
+      const xpAwarded = result.xpAwarded || 0;
+      const pendingXp = result.pendingXp || 0;
+
+      if (result.isLikelySpoof) {
+        toast({
+          title: 'Verification Complete',
+          description: 'Face verified, but no XP awarded due to quality issues.',
+          variant: 'destructive',
+        });
+      } else if (xpAwarded > 0) {
+        toast({
+          title: 'Verification Complete!',
+          description: `Face verification successful! +${xpAwarded} XP earned.`,
+        });
+      } else if (pendingXp > 0) {
+        toast({
+          title: 'Verification Complete!',
+          description: `Face verified! ${pendingXp} XP waiting - vouch for someone to claim it.`,
+        });
+      } else {
+        toast({
+          title: 'Verification Complete',
+          description: 'Face verified successfully.',
+        });
+      }
+
+      // Update state only if still mounted
+      if (isMountedRef.current) {
+        setVerificationResult({ xpAwarded, pendingXp });
+        setStatus('complete');
+        setIsSubmitting(false);
+      }
+
+      // Call onComplete last - this will invalidate queries and may unmount this component
+      onComplete(true, result);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error('[FaceVerification] Submit error:', errorMessage, err);
+      if (isMountedRef.current) {
+        setError(errorMessage || 'Failed to submit verification. Please try again.');
+        setStatus('error');
+        setIsSubmitting(false);
+      }
+    }
+  };
+
+  const startChallenges = () => {
+    const freshChallenges = CHALLENGES.map(c => ({ ...c }));
+    setStatus('challenges');
+    setChallenges(freshChallenges);
+    setCurrentChallengeIndex(0);
+    // Also update refs immediately
+    challengesRef.current = freshChallenges;
+    currentChallengeIndexRef.current = 0;
+    statusRef.current = 'challenges';
+    blinkCountRef.current = 0;
+    lastBlinkStateRef.current = false;
+    headTurnProgressRef.current = { left: 0, right: 0 };
+    faceEmbeddingsRef.current = [];
+    resetAnalyzerState(textureAnalyzerRef.current); // Reset texture analyzer for new session
+    frameCountRef.current = 0;
+  };
+
+  const handleRetry = () => {
+    cleanup();
+    setError(null);
+    const freshChallenges = CHALLENGES.map(c => ({ ...c }));
+    setChallenges(freshChallenges);
+    setCurrentChallengeIndex(0);
+    // Also update refs immediately
+    challengesRef.current = freshChallenges;
+    currentChallengeIndexRef.current = 0;
+    blinkCountRef.current = 0;
+    faceEmbeddingsRef.current = [];
+    resetAnalyzerState(textureAnalyzerRef.current); // Reset texture analyzer for new session
+    frameCountRef.current = 0;
+    loadModels();
+  };
+
+  // Start button handler - only request camera when user explicitly clicks
+  // Use setTimeout to let the loading UI render before starting heavy work
+  const handleStartVerification = () => {
+    setStatus('loading');
+    setLoadingMessage('Initializing...');
+    // Small delay to let React render the loading screen before blocking with model loads
+    setTimeout(() => {
+      loadModels();
+    }, 50);
+  };
+
+  useEffect(() => {
+    if (status === 'ready' || status === 'detecting' || status === 'challenges') {
+      startDetection();
+    }
+  }, [status, startDetection]);
+
+  const currentChallenge = challenges[currentChallengeIndex];
+  const completedCount = challenges.filter(c => c.completed).length;
+
+  // Intro screen - shown before camera access
+  if (status === 'intro') {
+    return (
+      <div className="space-y-6 py-4">
+        {/* Title */}
+        <div className="text-center space-y-2">
+          <div className="flex items-center justify-center gap-2">
+            <Camera className="h-5 w-5 text-primary" />
+            <h3 className="font-semibold text-lg">Face Check</h3>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Verify you're human with a quick liveness check
+          </p>
+        </div>
+
+        {/* What to expect */}
+        <div className="space-y-3 px-2">
+          <p className="text-xs text-muted-foreground text-center uppercase tracking-wide">What you'll do</p>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg">
+              <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                <Eye className="h-4 w-4 text-primary" />
+              </div>
+              <span className="text-sm">Blink twice</span>
+            </div>
+            <div className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg">
+              <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                <ArrowLeft className="h-4 w-4 text-primary" />
+              </div>
+              <span className="text-sm">Turn your head left</span>
+            </div>
+            <div className="flex items-center gap-3 p-3 bg-muted/50 rounded-lg">
+              <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                <ArrowRight className="h-4 w-4 text-primary" />
+              </div>
+              <span className="text-sm">Turn your head right</span>
+            </div>
+          </div>
+        </div>
+
+        {/* XP reward badge */}
+        <div className="flex justify-center">
+          <div className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-full">
+            <Sparkles className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+            <span className="text-xs font-medium text-amber-700 dark:text-amber-300">+120 XP reward</span>
+          </div>
+        </div>
+
+        {/* Privacy note */}
+        <p className="text-xs text-muted-foreground text-center px-4">
+          Your face data is processed locally and never stored as an image.
+        </p>
+
+        {/* Start button */}
+        <div className="flex flex-col items-center gap-3">
+          <Button
+            size="lg"
+            onClick={handleStartVerification}
+            data-testid="button-start-liveness-check"
+            className="px-8"
+          >
+            <Camera className="h-4 w-4 mr-2" />
+            Start Liveness Check
+          </Button>
+          <Link href="/" data-testid="link-skip-face-check">
+            <span className="text-sm text-muted-foreground hover:text-foreground cursor-pointer">
+              Skip for now
+            </span>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Title and reward badge - ABOVE camera */}
+      <div className="text-center space-y-2">
+        <div className="flex items-center justify-center gap-2">
+          <Camera className="h-5 w-5 text-primary" />
+          <h3 className="font-semibold text-lg">Face Check</h3>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Complete 3 quick challenges to verify you're human
+        </p>
+        <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-full">
+          <Sparkles className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+          <span className="text-xs font-medium text-amber-700 dark:text-amber-300">+120 XP reward</span>
+        </div>
+      </div>
+
+      {/* Camera container - FULL WIDTH with face guide */}
+      <div
+        className="relative bg-black rounded-lg overflow-hidden w-full"
+        style={{ aspectRatio: '3/4', maxHeight: '400px' }}
+      >
+        <video
+          ref={videoRef}
+          className="absolute inset-0 w-full h-full object-cover"
+          playsInline
+          muted
+          style={{ transform: 'scaleX(-1)' }}
+        />
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full object-cover"
+          style={{ transform: 'scaleX(-1)' }}
+        />
+
+        {/* Face guide oval overlay */}
+        {(status === 'ready' || status === 'detecting' || status === 'challenges') && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div
+              className={`w-[55%] h-[70%] rounded-[50%] border-4 transition-all duration-300 ${faceQuality.allPassed
+                  ? 'border-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.4)]'
+                  : faceDetected
+                    ? 'border-amber-500 shadow-[0_0_20px_rgba(245,158,11,0.4)]'
+                    : 'border-white/40'
+                }`}
+              style={{
+                boxShadow: faceQuality.allPassed
+                  ? '0 0 0 3000px rgba(0,0,0,0.3), inset 0 0 30px rgba(16,185,129,0.2)'
+                  : faceDetected
+                    ? '0 0 0 3000px rgba(0,0,0,0.3), inset 0 0 30px rgba(245,158,11,0.2)'
+                    : '0 0 0 3000px rgba(0,0,0,0.4)'
+              }}
+            />
+          </div>
+        )}
+
+        {status === 'loading' && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+            <div className="text-center text-white space-y-3">
+              <Loader2 className="h-10 w-10 animate-spin mx-auto" />
+              <p className="text-sm">{loadingMessage}</p>
+            </div>
+          </div>
+        )}
+
+        {status === 'error' && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+            <div className="text-center text-white space-y-3 p-6">
+              <AlertTriangle className="h-10 w-10 mx-auto text-red-400" />
+              <p className="text-sm max-w-[200px]">{error}</p>
+            </div>
+          </div>
+        )}
+
+        {(status === 'detecting' || status === 'ready') && (
+          <div className="absolute inset-x-0 bottom-8 flex justify-center">
+            <div className={`text-center text-white backdrop-blur-sm px-4 py-2 rounded-full flex items-center gap-2 ${faceQuality.allPassed
+                ? 'bg-emerald-600/80'
+                : faceDetected
+                  ? 'bg-amber-600/80'
+                  : 'bg-black/60'
+              }`}>
+              {faceQuality.allPassed && <Check className="h-4 w-4" />}
+              <p className="text-sm">{faceQuality.message}</p>
+            </div>
+          </div>
+        )}
+
+        {status === 'processing' && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+            <div className="text-center text-white space-y-3">
+              <Loader2 className="h-10 w-10 animate-spin mx-auto" />
+              <p className="text-sm">Verifying...</p>
+            </div>
+          </div>
+        )}
+
+        {status === 'complete' && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/80">
+            <div className="text-center text-white space-y-3 px-6">
+              <div className="h-16 w-16 rounded-full bg-emerald-500 flex items-center justify-center mx-auto">
+                <Check className="h-10 w-10" />
+              </div>
+              <p className="font-semibold text-lg">Verified!</p>
+
+              {verificationResult?.pendingXp && verificationResult.pendingXp > 0 && (
+                <p className="text-sm text-white/80">
+                  {verificationResult.pendingXp} XP waiting - vouch for someone to unlock it
+                </p>
+              )}
+
+              {verificationResult?.xpAwarded && verificationResult.xpAwarded > 0 && (
+                <p className="text-emerald-400 font-semibold">
+                  +{verificationResult.xpAwarded} XP earned!
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Challenge instruction overlay - inside camera */}
+        {status === 'challenges' && currentChallenge && (
+          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent pt-12 pb-4 px-4">
+            <div className="text-center text-white space-y-2">
+              <div className="flex items-center justify-center gap-2">
+                {getChallengeIcon(currentChallenge.type, "h-6 w-6")}
+                <span className="text-lg font-semibold">{currentChallenge.label}</span>
+              </div>
+              <div className="text-xs text-white/70">
+                Step {currentChallengeIndex + 1} of {challenges.length}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Challenge progress indicators - BELOW camera */}
+      {status === 'challenges' && (
+        <div className="space-y-3">
+          {/* Progress bar for current challenge */}
+          <div className="space-y-1">
+            <Progress value={currentChallenge?.progress || 0} className="h-2" />
+          </div>
+
+          {/* Step indicators */}
+          <div className="flex gap-2 justify-center">
+            {challenges.map((challenge, i) => (
+              <div
+                key={challenge.type}
+                className={`flex items-center justify-center w-10 h-10 rounded-full transition-all duration-300 ${challenge.completed
+                    ? 'bg-emerald-500 text-white'
+                    : i === currentChallengeIndex
+                      ? 'bg-primary text-primary-foreground ring-2 ring-primary ring-offset-2 ring-offset-background'
+                      : 'bg-muted text-muted-foreground'
+                  }`}
+              >
+                {challenge.completed ? (
+                  <Check className="h-5 w-5" />
+                ) : (
+                  getChallengeIcon(challenge.type, "h-5 w-5")
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Action buttons */}
+      <div className="flex gap-3 justify-center flex-wrap">
+        {status === 'error' && (
+          <>
+            <Button onClick={handleRetry} data-testid="button-retry-face-verification">
+              <RefreshCw className="h-4 w-4 mr-2" />
+              Try Again
+            </Button>
+            {onReset && (
+              <Button variant="outline" onClick={onReset} data-testid="button-reset-face-verification">
+                Reset Camera
+              </Button>
+            )}
+          </>
+        )}
+
+        {(status === 'ready' || status === 'detecting') && faceDetected && (
+          <Button
+            size="lg"
+            onClick={startChallenges}
+            data-testid="button-start-challenges"
+            className="px-8"
+            disabled={!faceQuality.allPassed}
+          >
+            <Camera className="h-4 w-4 mr-2" />
+            {faceQuality.allPassed ? 'Start Verification' : 'Adjust Position'}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}

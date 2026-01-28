@@ -1,0 +1,50 @@
+
+> new-mini-app-quickstart@0.1.0 build
+> next build
+
+   ▲ Next.js 15.3.6
+
+   Creating an optimized production build ...
+Failed to compile.
+
+./components/QRCodeDisplay.tsx
+Module not found: Can't resolve 'qrcode'
+
+https://nextjs.org/docs/messages/module-not-found
+
+Import trace for requested module:
+./components/pages/Home.tsx
+./app/(protected)/home/page.tsx
+
+./components/QRScanner.tsx
+Module not found: Can't resolve 'html5-qrcode'
+
+https://nextjs.org/docs/messages/module-not-found
+
+Import trace for requested module:
+./components/pages/MaxFlow.tsx
+./app/(protected)/maxflow/page.tsx
+
+https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm
+Module build failed: UnhandledSchemeError: Reading from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm" is not handled by plugins (Unhandled scheme).
+Webpack supports "data:" and "file:" URIs by default.
+You may need an additional plugin to handle "https:" URIs.
+    at C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:29:408376
+    at Hook.eval [as callAsync] (eval at create (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:14:9224), <anonymous>:6:1)
+    at Hook.CALL_ASYNC_DELEGATE [as _callAsync] (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:14:6378)
+    at Object.processResource (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:29:408301)
+    at processResource (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\loader-runner\LoaderRunner.js:1:5308)
+    at iteratePitchingLoaders (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\loader-runner\LoaderRunner.js:1:4667)
+    at runLoaders (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\loader-runner\LoaderRunner.js:1:8590)
+    at NormalModule._doBuild (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:29:408163)
+    at NormalModule.build (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:29:410176)
+    at C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\webpack\bundle5.js:29:82494
+
+Import trace for requested module:
+https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm
+./components/FaceVerification.tsx
+./components/pages/MaxFlow.tsx
+./app/(protected)/maxflow/page.tsx
+
+
+> Build failed because of webpack errors
