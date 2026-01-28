@@ -1,0 +1,69 @@
+
+> new-mini-app-quickstart@0.1.0 build
+> next build
+
+   ▲ Next.js 15.3.6
+
+   Creating an optimized production build ...
+ ⚠ Compiled with warnings in 40.0s
+
+./components/pages/Pool.tsx
+Attempted import error: 'useSearch' is not exported from 'wouter' (imported as 'useSearch').
+
+Import trace for requested module:
+./components/pages/Pool.tsx
+./app/(protected)/pool/page.tsx
+
+./components/pages/Pool.tsx
+Attempted import error: 'useSearch' is not exported from 'wouter' (imported as 'useSearch').
+
+Import trace for requested module:
+./components/pages/Pool.tsx
+./app/(protected)/pool/page.tsx
+
+   Skipping validation of types
+   Skipping linting
+   Collecting page data ...
+   Generating static pages (0/27) ...
+ReferenceError: indexedDB is not defined
+    at <unknown> (C:\Users\tiago\social-predicts\.next\server\chunks\5189.js:2049:2437)
+    at o (C:\Users\tiago\social-predicts\.next\server\chunks\5189.js:2049:2579)
+    at a (C:\Users\tiago\social-predicts\.next\server\chunks\5189.js:2049:2623)
+    at <unknown> (C:\Users\tiago\social-predicts\.next\server\chunks\5946.js:1:8833)
+    at 51172 (C:\Users\tiago\social-predicts\.next\server\chunks\5946.js:1:8969)
+    at t (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+    at 72791 (C:\Users\tiago\social-predicts\.next\server\chunks\5946.js:1:10779)
+    at t (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+    at 87730 (C:\Users\tiago\social-predicts\.next\server\app\(public)\page.js:1:11295)
+    at Object.t [as require] (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+(node:25888) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:10992) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+ReferenceError: indexedDB is not defined
+    at <unknown> (C:\Users\tiago\social-predicts\.next\server\chunks\5189.js:2049:2437)
+    at o (C:\Users\tiago\social-predicts\.next\server\chunks\5189.js:2049:2579)
+    at a (C:\Users\tiago\social-predicts\.next\server\chunks\5189.js:2049:2623)
+    at <unknown> (C:\Users\tiago\social-predicts\.next\server\chunks\5946.js:1:8833)
+    at 51172 (C:\Users\tiago\social-predicts\.next\server\chunks\5946.js:1:8969)
+    at t (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+    at 72791 (C:\Users\tiago\social-predicts\.next\server\chunks\5946.js:1:10779)
+    at t (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+    at 78954 (C:\Users\tiago\social-predicts\.next\server\app\(public)\pay\page.js:1:6612)
+    at Object.t [as require] (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+Error occurred prerendering page "/stellar". Read more: https://nextjs.org/docs/messages/prerender-error
+TypeError: Cannot read properties of undefined (reading 'VITE_STELLAR_WALLET_URL')
+    at 63942 (C:\Users\tiago\social-predicts\.next\server\app\(public)\stellar\page.js:1:4379)
+    at t (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+    at 2092 (C:\Users\tiago\social-predicts\.next\server\app\(public)\stellar\page.js:1:125)
+    at Object.t [as require] (C:\Users\tiago\social-predicts\.next\server\webpack-runtime.js:1:143)
+    at require (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\next-server\app-page.runtime.prod.js:140:9879)
+    at c (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\next-server\app-page.runtime.prod.js:92:680)
+    at F (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\next-server\app-page.runtime.prod.js:92:10688)
+    at X (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\next-server\app-page.runtime.prod.js:92:13395)
+    at C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\next-server\app-page.runtime.prod.js:92:15686
+    at Object._fromJSON (C:\Users\tiago\social-predicts\node_modules\next\dist\compiled\next-server\app-page.runtime.prod.js:92:15720)
+Export encountered an error on /(public)/stellar/page: /stellar, exiting the build.
+   Generating static pages (6/27) 
+   Generating static pages (13/27) 
+ ⨯ Next.js build worker exited with code: 1 and signal: null

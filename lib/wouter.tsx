@@ -1,8 +1,13 @@
 "use client";
 
 import NextLink from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback } from "react";
+
+export function useSearch() {
+    const searchParams = useSearchParams();
+    return searchParams.toString();
+}
 
 export function useLocation() {
     const pathname = usePathname();
